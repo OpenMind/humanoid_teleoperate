@@ -344,9 +344,12 @@ if __name__ == '__main__':
     parser.add_argument('--tast-name', type = str, default = 'pick cube', help = 'task name for recording')
     parser.add_argument('--task-goal', type = str, default = 'e.g. pick the red cube on the table.', help = 'task goal for recording')
 
+    # remote flags
+    parser.add_argument('--ws_host', type = str, default = "0.0.0.0", help = 'WebSocket server address')
     parser.add_argument('--websocket_port', type = int, default = 8765, help = 'WebSocket server port')
     parser.add_argument('--send_latest', action = 'store_true', default = True, help = 'Send only latest data (low latency mode)')
     parser.add_argument('--send_sequential', dest = 'send_latest', action = 'store_false', help = 'Send all data sequentially')
+    parser.add_argument('--image_server_ip', type = str, default = '127.0.0.1', help = 'Image server IP')
 
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
@@ -391,15 +394,15 @@ if __name__ == '__main__':
         wrist_img_shm = shared_memory.SharedMemory(create = True, size = np.prod(wrist_img_shape) * np.uint8().itemsize)
         wrist_img_array = np.ndarray(wrist_img_shape, dtype = np.uint8, buffer = wrist_img_shm.buf)
         img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name, 
-                                 wrist_img_shape = wrist_img_shape, wrist_img_shm_name = wrist_img_shm.name, server_address="127.0.0.1")
+                                 wrist_img_shape = wrist_img_shape, wrist_img_shm_name = wrist_img_shm.name, server_address=args.image_server_ip)
     elif WRIST and not args.sim:
         wrist_img_shape = (img_config['wrist_camera_image_shape'][0], img_config['wrist_camera_image_shape'][1] * 2, 3)
         wrist_img_shm = shared_memory.SharedMemory(create = True, size = np.prod(wrist_img_shape) * np.uint8().itemsize)
         wrist_img_array = np.ndarray(wrist_img_shape, dtype = np.uint8, buffer = wrist_img_shm.buf)
         img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name, 
-                                 wrist_img_shape = wrist_img_shape, wrist_img_shm_name = wrist_img_shm.name)
+                                 wrist_img_shape = wrist_img_shape, wrist_img_shm_name = wrist_img_shm.name, server_address=args.image_server_ip)
     else:
-        img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name)
+        img_client = ImageClient(tv_img_shape = tv_img_shape, tv_img_shm_name = tv_img_shm.name, server_address=args.image_server_ip)
 
     image_receive_thread = threading.Thread(target = img_client.receive_process, daemon = True)
     image_receive_thread.daemon = True
@@ -410,7 +413,7 @@ if __name__ == '__main__':
                                  return_state_data=True, return_hand_rot_data = False)
 
     # Initialize WebSocket server
-    ws_server = WebSocketServer(host="0.0.0.0", port=args.websocket_port)
+    ws_server = WebSocketServer(host=args.ws_host, port=args.websocket_port)
     ws_server.start()
     
     # simulation mode
