@@ -329,7 +329,7 @@ class Dex1_1_Gripper_Controller:
                              dual_gripper_state_out = None, dual_gripper_action_out = None):
         self.running = True
         if self.simulation_mode:
-            DELTA_GRIPPER_CMD = 1.0
+            DELTA_GRIPPER_CMD = 0.18
         else:   
             DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
         THUMB_INDEX_DISTANCE_MIN = 5.0
@@ -369,19 +369,20 @@ class Dex1_1_Gripper_Controller:
                     left_gripper_value  = left_gripper_value_in.value
                 with right_gripper_value_in.get_lock():
                     right_gripper_value = right_gripper_value_in.value
-
+                # get current dual gripper motor state
+                dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
+                
                 if left_gripper_value != 0.0 or right_gripper_value != 0.0: # if input data has been initialized.
                     # Linear mapping from [0, THUMB_INDEX_DISTANCE_MAX] to gripper action range
                     left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
                     right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
-
-                # get current dual gripper motor state
-                dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
-
                 # clip dual gripper action to avoid overflow
-                left_actual_action  = np.clip(left_target_action,  dual_gripper_state[0] - DELTA_GRIPPER_CMD, dual_gripper_state[0] + DELTA_GRIPPER_CMD) 
-                right_actual_action = np.clip(right_target_action, dual_gripper_state[1] - DELTA_GRIPPER_CMD, dual_gripper_state[1] + DELTA_GRIPPER_CMD)
-
+                if not self.simulation_mode:
+                    left_actual_action  = np.clip(left_target_action,  dual_gripper_state[0] - DELTA_GRIPPER_CMD, dual_gripper_state[0] + DELTA_GRIPPER_CMD) 
+                    right_actual_action = np.clip(right_target_action, dual_gripper_state[1] - DELTA_GRIPPER_CMD, dual_gripper_state[1] + DELTA_GRIPPER_CMD)
+                else:
+                    left_actual_action  = left_target_action
+                    right_actual_action = right_target_action
                 dual_gripper_action = np.array([left_actual_action, right_actual_action])
 
                 if self.smooth_filter:
