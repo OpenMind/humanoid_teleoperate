@@ -225,12 +225,13 @@ class WebSocketServer:
             self._handle_client,
             self.host,
             self.port,
-            compression=None,  # Disable compression for lower latency
+            compression="deflate",  # Disable compression for lower latency
             max_size=10 * 1024 * 1024,  # 10MB max message size
             max_queue=1,  # Minimal queue for real-time
             write_limit=0,  # No write buffer limit
-            ping_interval=20,
-            ping_timeout=10
+            ping_interval=30,
+            ping_timeout=60,
+            close_timeout=60
         )
         
         logger_mp.info(f"Server ready for connections")
@@ -254,23 +255,23 @@ class WebSocketServer:
         logger_mp.info(f"Client connected from {client_address}")
         
         try:
-            # Handle ping messages for latency measurement
             async for message in websocket:
                 if message == "ping":
                     await websocket.send("pong")
                 elif message.startswith("latency:"):
-                    # Client reporting latency
                     try:
                         latency = float(message.split(":")[1])
                         with self.stats_lock:
                             self.latency_samples.append(latency)
                     except:
                         pass
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as e:
+            logger_mp.warning(f"Client {client_address} disconnected: {e}")
+        except Exception as e:
+            logger_mp.error(f"Error handling client {client_address}: {e}")
         finally:
             self.connected_clients.remove(websocket)
-            logger_mp.info(f"Client disconnected from {client_address}")
+            logger_mp.info(f"Client {client_address} removed from active connections")
             
     async def _broadcast_data(self):
         """High-performance broadcast loop"""
@@ -320,7 +321,7 @@ class WebSocketServer:
     async def _send_to_client(self, client, message, disconnected_set):
         """Send message to a single client with error handling"""
         try:
-            await asyncio.wait_for(client.send(message), timeout=0.1)
+            await asyncio.wait_for(client.send(message), timeout=1.0)
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError):
             disconnected_set.add(client)
         except Exception as e:
