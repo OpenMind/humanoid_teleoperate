@@ -1,0 +1,1 @@
+python3 motion_capture.py --ee=dex3 --motion --image_server_ip SERVER_IP --headless
