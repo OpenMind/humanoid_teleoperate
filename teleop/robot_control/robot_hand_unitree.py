@@ -140,11 +140,11 @@ class Dex3_1_Controller:
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None):
+                            dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None):
         self.running = True
 
-        left_q_target  = np.full(Dex3_Num_Motors, 0)
-        right_q_target = np.full(Dex3_Num_Motors, 0)
+        left_q_target  = np.full(Dex3_Num_Motors, 0.0)
+        right_q_target = np.full(Dex3_Num_Motors, 0.0)
 
         q = 0.0
         dq = 0.0
@@ -152,12 +152,23 @@ class Dex3_1_Controller:
         kp = 1.5
         kd = 0.2
 
+        # Logging configuration
+        LOG_INTERVAL = 1.0  # Log every 1 second (adjust as needed)
+        last_log_time = 0
+        iteration_count = 0
+        
+        # For computing running statistics
+        left_errors_history = []
+        right_errors_history = []
+        MAX_HISTORY = 100  # Keep last 100 samples for statistics
+
         # initialize dex3-1's left hand cmd msg
         self.left_msg  = unitree_hg_msg_dds__HandCmd_()
         for id in Dex3_1_Left_JointIndex:
             ris_mode = self._RIS_Mode(id = id, status = 0x01)
             motor_mode = ris_mode._mode_to_uint8()
             self.left_msg.motor_cmd[id].mode = motor_mode
+            # logger_mp.info(f"left: {id}")
             self.left_msg.motor_cmd[id].q    = q
             self.left_msg.motor_cmd[id].dq   = dq
             self.left_msg.motor_cmd[id].tau  = tau
@@ -167,6 +178,7 @@ class Dex3_1_Controller:
         # initialize dex3-1's right hand cmd msg
         self.right_msg = unitree_hg_msg_dds__HandCmd_()
         for id in Dex3_1_Right_JointIndex:
+            # logger_mp.info(f"right: {id}")
             ris_mode = self._RIS_Mode(id = id, status = 0x01)
             motor_mode = ris_mode._mode_to_uint8()
             self.right_msg.motor_cmd[id].mode = motor_mode  
@@ -179,6 +191,8 @@ class Dex3_1_Controller:
         try:
             while self.running:
                 start_time = time.time()
+                iteration_count += 1
+                
                 # get dual hand state
                 with left_hand_array_in.get_lock():
                     left_hand_data  = np.array(left_hand_array_in[:]).reshape(25, 3).copy()
@@ -186,15 +200,103 @@ class Dex3_1_Controller:
                     right_hand_data = np.array(right_hand_array_in[:]).reshape(25, 3).copy()
 
                 # Read left and right q_state from shared arrays
-                state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
+                left_q_state = np.array(left_hand_state_array[:])
+                right_q_state = np.array(right_hand_state_array[:])
+                state_data = np.concatenate((left_q_state, right_q_state))
 
                 if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 
-                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.left_dex_retargeting_to_hardware]
                     right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
 
+                    # Apply offsets
+                    # left_q_target[0] = left_q_target[0] + 0.3
+                    # right_q_target[0] = right_q_target[0] + 0.3
+                    left_q_target[0] = left_q_target[0] * 0.5 + 0.55 * 0.5
+                    left_q_target[1] = left_q_target[1] * 0.6 + 0.5 * 0.4
+                    left_q_target[2] = left_q_target[2] * 0.75 + 0.1 * 0.25
+                    right_q_target[0] = right_q_target[0] * 0.5 + 0.55 * 0.5
+                
+                # logger_mp.info(f"set 0.7, left_q_target is now: {left_q_target}")
+                # Compute errors
+                left_errors = left_q_target - left_q_state
+                right_errors = right_q_target - right_q_state
+                
+                # Store errors for statistics
+                left_errors_history.append(left_errors)
+                right_errors_history.append(right_errors)
+                if len(left_errors_history) > MAX_HISTORY:
+                    left_errors_history.pop(0)
+                    right_errors_history.pop(0)
+                
+                # Log at intervals
+                current_time = time.time()
+                # if current_time - last_log_time >= LOG_INTERVAL:
+                #     logger_mp.info("\n" + "="*80)
+                #     logger_mp.info(f"[Iteration {iteration_count}] Control Loop Status Report")
+                #     logger_mp.info("="*80)
+                    
+                #     # Log joint names for reference
+                #     logger_mp.info("\nJoint Names:")
+                #     logger_mp.info(f"  Left:  {self.hand_retargeting.left_dex3_api_joint_names}")
+                #     logger_mp.info(f"  Right: {self.hand_retargeting.right_dex3_api_joint_names}")
+                    
+                #     # Log targets
+                #     logger_mp.info("\nTarget Q values:")
+                #     logger_mp.info(f"  Left:  {np.round(left_q_target, 3).tolist()}")
+                #     logger_mp.info(f"  Right: {np.round(right_q_target, 3).tolist()}")
+                    
+                #     # Log current states
+                #     logger_mp.info("\nCurrent Q states:")
+                #     logger_mp.info(f"  Left:  {np.round(left_q_state, 3).tolist()}")
+                #     logger_mp.info(f"  Right: {np.round(right_q_state, 3).tolist()}")
+                    
+                #     # Log errors
+                #     logger_mp.info("\nPosition Errors (target - state):")
+                #     logger_mp.info(f"  Left:  {np.round(left_errors, 3).tolist()}")
+                #     logger_mp.info(f"  Right: {np.round(right_errors, 3).tolist()}")
+                    
+                #     # Log error statistics
+                #     if len(left_errors_history) > 0:
+                #         left_errors_array = np.array(left_errors_history)
+                #         right_errors_array = np.array(right_errors_history)
+                        
+                #         logger_mp.info("\nError Statistics (over last {} samples):".format(len(left_errors_history)))
+                #         logger_mp.info("  Left hand:")
+                #         logger_mp.info(f"    Mean abs error: {np.round(np.mean(np.abs(left_errors_array), axis=0), 3).tolist()}")
+                #         logger_mp.info(f"    Max abs error:  {np.round(np.max(np.abs(left_errors_array), axis=0), 3).tolist()}")
+                #         logger_mp.info(f"    RMS error:      {np.round(np.sqrt(np.mean(left_errors_array**2, axis=0)), 3).tolist()}")
+                        
+                #         logger_mp.info("  Right hand:")
+                #         logger_mp.info(f"    Mean abs error: {np.round(np.mean(np.abs(right_errors_array), axis=0), 3).tolist()}")
+                #         logger_mp.info(f"    Max abs error:  {np.round(np.max(np.abs(right_errors_array), axis=0), 3).tolist()}")
+                #         logger_mp.info(f"    RMS error:      {np.round(np.sqrt(np.mean(right_errors_array**2, axis=0)), 3).tolist()}")
+                    
+                #     # Log thumb values specifically (since that's your concern)
+                #     logger_mp.info("\nThumb Analysis (first 3 joints):")
+                #     logger_mp.info(f"  Left thumb:")
+                #     logger_mp.info(f"    Target:  {np.round(left_q_target[:3], 3).tolist()}")
+                #     logger_mp.info(f"    State:   {np.round(left_q_state[:3], 3).tolist()}")
+                #     logger_mp.info(f"    Error:   {np.round(left_errors[:3], 3).tolist()}")
+                #     logger_mp.info(f"  Right thumb:")
+                #     logger_mp.info(f"    Target:  {np.round(right_q_target[:3], 3).tolist()}")
+                #     logger_mp.info(f"    State:   {np.round(right_q_state[:3], 3).tolist()}")
+                #     logger_mp.info(f"    Error:   {np.round(right_errors[:3], 3).tolist()}")
+                    
+                #     # Log hand keypoint data for debugging
+                #     logger_mp.info("\nHand Keypoint Debug:")
+                #     logger_mp.info(f"  Left hand keypoints used:")
+                #     logger_mp.info(f"    Wrist (0):     {np.round(left_hand_data[0], 3).tolist()}")
+                #     logger_mp.info(f"    Thumb tip (4): {np.round(left_hand_data[4], 3).tolist()}")
+                #     logger_mp.info(f"    Index tip (9): {np.round(left_hand_data[9], 3).tolist()}")
+                #     logger_mp.info(f"    Middle tip (14): {np.round(left_hand_data[14], 3).tolist()}")
+                    
+                #     logger_mp.info("\n" + "="*80 + "\n")
+                    
+                #     last_log_time = current_time
+                
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))    
                 if dual_hand_state_array_out and dual_hand_action_array_out:
@@ -202,8 +304,12 @@ class Dex3_1_Controller:
                         dual_hand_state_array_out[:] = state_data
                         dual_hand_action_array_out[:] = action_data
 
+                # Only log basic info at high frequency (comment out if too verbose)
+                # logger_mp.debug(f"left: {left_q_target}")
+                # logger_mp.debug(f"right: {right_q_target}")
+                # logger_mp.info(f"About to send to robot - left_q_target: {left_q_target}")
                 self.ctrl_dual_hand(left_q_target, right_q_target)
-                current_time = time.time()
+                
                 time_elapsed = current_time - start_time
                 sleep_time = max(0, (1 / self.fps) - time_elapsed)
                 time.sleep(sleep_time)
@@ -264,7 +370,7 @@ class Dex1_1_Gripper_Controller:
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
         
-        if filter and not self.simulation_mode:
+        if filter:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
         else:
             self.smooth_filter = None

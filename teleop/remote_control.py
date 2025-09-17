@@ -64,7 +64,7 @@ class WebSocketReceiver:
     """High-performance WebSocket client for receiving TeleData"""
     
     def __init__(self, uri="ws://localhost:8765", use_msgpack=True, 
-                 queue_size=1, measure_latency=True, logger=None):
+                 queue_size=1, measure_latency=False, logger=None):
         self.uri = uri
         self.use_msgpack = use_msgpack
         self.measure_latency = measure_latency
@@ -199,12 +199,13 @@ class WebSocketReceiver:
                 # Configure WebSocket connection for low latency
                 async with websockets.connect(
                     self.uri,
-                    compression=None,  # Disable compression for lower latency
+                    compression="deflate",  # Disable compression for lower latency
                     max_size=10 * 1024 * 1024,  # 10MB max message size
                     max_queue=1,  # Minimal queue
                     write_limit=0,  # No write buffer limit
-                    ping_interval=20,
-                    ping_timeout=10
+                    ping_interval=30,
+                    ping_timeout=60,
+                    close_timeout=60
                 ) as websocket:
                     
                     logger_mp.info(f"Successfully connected to WebSocket server at {self.uri}")
@@ -269,6 +270,7 @@ class WebSocketReceiver:
                     else:
                         # Try to parse as JSON
                         try:
+                            logger_mp.info("Received a message")
                             data = json.loads(message)
                         except json.JSONDecodeError as e:
                             logger_mp.debug(f"Received non-JSON string: {message[:100]}")
@@ -375,29 +377,25 @@ class WebSocketReceiver:
                 break
                 
     def get_latest_data(self, timeout: float = 0.001) -> Optional[TeleData]:
-        """Get the latest TeleData from the queue
-        
-        Returns:
-            TeleData dataclass instance or None if no data available
-        """
+        """Get only the most recent data, discard old"""
         try:
-            # Try to get data without blocking first
+            # Get all available data but keep only the last
             data = None
-            while True:
-                try:
-                    data = self.data_queue.get_nowait()
-                except queue.Empty:
-                    break
-                    
-            # If no data was available, wait with timeout
-            if data is None:
-                data = self.data_queue.get(timeout=timeout)
+            while not self.data_queue.empty():
+                data = self.data_queue.get_nowait()
                 
+            # If nothing was available, wait briefly
+            if data is None and timeout > 0:
+                try:
+                    data = self.data_queue.get(timeout=timeout)
+                except queue.Empty:
+                    pass
+                    
             return data
             
-        except queue.Empty:
+        except Exception as e:
             return None
-            
+
     def print_stats(self):
         """Print detailed performance statistics"""
         with self.stats_lock:
@@ -451,7 +449,7 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'e.g. pick the red cube on the table.', help = 'task goal for recording')
 
     # remote flags
-    parser.add_argument('--websocket_uri', type = str, default = 'ws://0.0.0.0:8765', help = 'WebSocket server URI')
+    parser.add_argument('--websocket_uri', type = str, default = 'ws://10.0.0.37:8765', help = 'WebSocket server URI')
     parser.add_argument('--image_server_ip', type = str, default = '127.0.0.1', help = 'Image server IP')
 
     args = parser.parse_args()
@@ -469,7 +467,7 @@ if __name__ == '__main__':
         img_config = {
             'fps': 30,
             'head_camera_type': 'opencv',
-            'head_camera_image_shape': [480, 1280],  # Head camera resolution
+            'head_camera_image_shape': [540, 960],  # Head camera resolution
             'head_camera_id_numbers': [0]
         }
 
@@ -645,11 +643,16 @@ if __name__ == '__main__':
                             publish_reset_category(1, reset_pose_publisher)
 
                 # get input data
+                t_get_start = time.time()
                 tele_data = ws_receiver.get_latest_data(timeout=0.001)
+                t_get_end = time.time()
+
+                if t_get_end - t_get_start > 0.01:  # Log if it takes more than 10ms
+                    logger_mp.warning(f"get_latest_data took {t_get_end - t_get_start:.3f}s!")
 
                 if tele_data is None:
                     # logger_mp.warning("No teledata received, skipping")
-                    time.sleep(0.01)
+                    # time.sleep(0.01)
                     continue
 
                 if (args.ee == "dex3" or args.ee == "inspire1" or args.ee == "brainco") and args.xr_mode == "hand":
@@ -685,15 +688,23 @@ if __name__ == '__main__':
                                     -tele_data.tele_state.right_thumbstick_value[0] * 0.3)
 
                 # get current robot state data.
+                t1 = time.time()
                 current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
                 current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+                t2 = time.time()
 
                 # solve ik using motor data and wrist pose, then use ik results to control arms.
                 time_ik_start = time.time()
                 sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_arm_pose, tele_data.right_arm_pose, current_lr_arm_q, current_lr_arm_dq)
+                t3 = time.time()
                 time_ik_end = time.time()
                 logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                t4 = time.time()
+
+                # if frame_counter % 1 == 0:
+                #     logger_mp.info(f"Timing - Get state: {t2-t1:.3f}s, IK: {t3-t2:.3f}s, Control: {t4-t3:.3f}s")
 
                 # record data
                 if args.record:
