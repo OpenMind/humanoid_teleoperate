@@ -34,8 +34,6 @@ class EpisodeWriter():
             self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit = "300MB")
             logger_mp.info("==> RerunLogger initializing ok.\n")
         
-        self.data = {}
-        self.episode_data = []
         self.item_id = -1
         self.episode_id = -1
         if os.path.exists(self.task_dir):
@@ -57,6 +55,9 @@ class EpisodeWriter():
         self.worker_thread.start()
 
         logger_mp.info("==> EpisodeWriter initialized successfully.\n")
+    
+    def is_ready(self):
+        return self.is_available
 
     def data_info(self, version='1.0.0', date=None, author=None):
         self.info = {
@@ -96,7 +97,6 @@ class EpisodeWriter():
 
         # Reset episode-related data and create necessary directories
         self.item_id = -1
-        self.episode_data = []
         self.episode_id = self.episode_id + 1
         
         self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
@@ -108,6 +108,13 @@ class EpisodeWriter():
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
         os.makedirs(self.audio_dir, exist_ok=True)
+        with open(self.json_path, "w", encoding="utf-8") as f:
+            f.write('{\n')
+            f.write('"info": ' + json.dumps(self.info, ensure_ascii=False, indent=4) + ',\n')
+            f.write('"text": ' + json.dumps(self.text, ensure_ascii=False, indent=4) + ',\n')
+            f.write('"data": [\n')
+        self.first_item = True   # Flag to handle commas in JSON array
+
         if self.rerun_log:
             self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
 
@@ -179,7 +186,11 @@ class EpisodeWriter():
                 item_data['audios'][mic] = os.path.join('audios', audio_name)
 
         # Update episode data
-        self.episode_data.append(item_data)
+        with open(self.json_path, "a", encoding="utf-8") as f:
+            if not self.first_item:
+                f.write(",\n")
+            f.write(json.dumps(item_data, ensure_ascii=False, indent=4))
+            self.first_item = False
 
         # Log data if necessary
         if self.rerun_log:
@@ -198,11 +209,9 @@ class EpisodeWriter():
         """
         Save the episode data to a JSON file.
         """
-        self.data['info'] = self.info
-        self.data['text'] = self.text
-        self.data['data'] = self.episode_data
-        with open(self.json_path, 'w', encoding='utf-8') as jsonf:
-            jsonf.write(json.dumps(self.data, indent=4, ensure_ascii=False))
+        with open(self.json_path, "a", encoding="utf-8") as f:
+            f.write("\n]\n}")      # Close the JSON array and object
+
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
         logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
