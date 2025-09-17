@@ -66,7 +66,7 @@ if __name__ == '__main__':
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording')
-    parser.add_argument('--tast-name', type = str, default = 'pick cube', help = 'task name for recording')
+    parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task name for recording')
     parser.add_argument('--task-goal', type = str, default = 'e.g. pick the red cube on the table.', help = 'task goal for recording')
 
     args = parser.parse_args()
@@ -198,9 +198,9 @@ if __name__ == '__main__':
     
     # record + headless mode
     if args.record and args.headless:
-        recorder = EpisodeWriter(task_dir = args.task_dir + args.tast_name, task_goal = args.task_goal, frequency = args.frequency, rerun_log = False)
+        recorder = EpisodeWriter(task_dir = args.task_dir + args.task_name, task_goal = args.task_goal, frequency = args.frequency, rerun_log = False)
     elif args.record and not args.headless:
-        recorder = EpisodeWriter(task_dir = args.task_dir + args.tast_name, task_goal = args.task_goal, frequency = args.frequency, rerun_log = True)
+        recorder = EpisodeWriter(task_dir = args.task_dir + args.task_name, task_goal = args.task_goal, frequency = args.frequency, rerun_log = True)
         
     try:
         logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
@@ -212,6 +212,9 @@ if __name__ == '__main__':
 
             if not args.headless:
                 tv_resized_image = cv2.resize(tv_img_array, (tv_img_shape[1] // 2, tv_img_shape[0] // 2))
+                if args.sim:
+                    wrist_resized_image = cv2.resize(wrist_img_array, (wrist_img_shape[1] // 2, wrist_img_shape[0] // 2))
+                    tv_resized_image = np.concatenate([tv_resized_image, wrist_resized_image], axis=1)
                 cv2.imshow("record image", tv_resized_image)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
