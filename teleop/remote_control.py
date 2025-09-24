@@ -72,8 +72,16 @@ class WebSocketReceiver:
         # Single-item queue for latest data only
         self.data_queue = queue.Queue(maxsize=queue_size)
         self.running = False
+        self.connected = False
+        self.connection_event = threading.Event()
         self.thread = None
         self.loop = None
+        self.websocket = None
+        
+        # Connection tracking
+        self.connection_attempts = 0
+        self.last_connected_time = None
+        self.last_data_time = time.time()
         
         # Performance tracking
         self.stats_lock = threading.Lock()
@@ -163,19 +171,21 @@ class WebSocketReceiver:
         
     def start(self):
         """Start the WebSocket client thread"""
+        if self.running:
+            return
         self.running = True
         self.thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self.thread.start()
-        logger_mp.info(f"WebSocket client started, connecting to {self.uri}")
+        logger_mp.info(f"WebSocket client starting: {self.uri}")
         
     def stop(self):
         """Stop the WebSocket client thread"""
         self.running = False
+        self.connection_event.set()  # Wake up any waiting threads
         if self.loop and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
         if self.thread:
             self.thread.join(timeout=5.0)
-        logger_mp.info("WebSocket client stopped")
         
     def _run_async_loop(self):
         """Run the async event loop in a separate thread"""
@@ -183,131 +193,124 @@ class WebSocketReceiver:
         asyncio.set_event_loop(self.loop)
         
         try:
-            self.loop.run_until_complete(self._receive_data())
+            self.loop.run_until_complete(self._connection_manager())
+        except Exception as e:
+            logger_mp.error(f"Event loop error: {e}")
         finally:
             self.loop.close()
+            self.loop = None
             
-    async def _receive_data(self):
-        """Main async function to receive data from WebSocket"""
+    async def _connection_manager(self):
+        """Manage WebSocket connection with automatic reconnection"""
         reconnect_delay = 1.0
-        max_reconnect_delay = 30.0
+        max_reconnect_delay = 10.0  # Reduced from 30s for faster recovery
         
         while self.running:
             try:
-                logger_mp.info(f"Attempting to connect to {self.uri}")
+                self.connection_attempts += 1
+                
+                # Only log every 5th attempt to reduce spam
+                if self.connection_attempts == 1 or self.connection_attempts % 5 == 0:
+                    logger_mp.info(f"Connection attempt #{self.connection_attempts}")
                 
                 # Configure WebSocket connection for low latency
                 async with websockets.connect(
                     self.uri,
-                    compression="deflate",  # Disable compression for lower latency
+                    compression=None,  # No compression for lower latency
                     max_size=10 * 1024 * 1024,  # 10MB max message size
                     max_queue=1,  # Minimal queue
                     write_limit=0,  # No write buffer limit
-                    ping_interval=30,
-                    ping_timeout=60,
-                    close_timeout=60
+                    ping_interval=10,  # More aggressive ping
+                    ping_timeout=5,    # Faster timeout detection
+                    close_timeout=10
                 ) as websocket:
                     
-                    logger_mp.info(f"Successfully connected to WebSocket server at {self.uri}")
-                    reconnect_delay = 1.0  # Reset reconnect delay on successful connection
+                    self.websocket = websocket
+                    self.connected = True
+                    self.connection_event.set()
+                    self.last_connected_time = time.time()
                     
-                    # Create tasks for receiving and latency measurement
-                    tasks = []
+                    logger_mp.info(f"Connected successfully")
+                    reconnect_delay = 1.0  # Reset delay on success
+                    
+                    # Create receive task
                     receive_task = asyncio.create_task(self._receive_loop(websocket))
-                    tasks.append(receive_task)
                     
-                    if self.measure_latency:
-                        latency_task = asyncio.create_task(self._measure_latency(websocket))
-                        tasks.append(latency_task)
-                        
-                    # Run until disconnected or stopped
+                    # Wait for task to complete
                     try:
-                        await asyncio.gather(*tasks)
+                        await receive_task
                     except asyncio.CancelledError:
-                        logger_mp.info("Tasks cancelled")
-                        break
+                        pass
                         
-            except websockets.exceptions.InvalidURI as e:
-                logger_mp.error(f"Invalid WebSocket URI: {e}")
-                break  # Don't retry on invalid URI
-                
-            except (websockets.exceptions.ConnectionClosed, 
-                    websockets.exceptions.WebSocketException,
-                    ConnectionRefusedError,
-                    OSError) as e:
-                logger_mp.warning(f"WebSocket connection failed: {e}")
+            except websockets.exceptions.InvalidURI:
+                logger_mp.error(f"Invalid URI: {self.uri}")
+                break  # Don't retry invalid URI
                 
             except Exception as e:
-                logger_mp.error(f"Unexpected WebSocket error: {e}", exc_info=True)
+                # Only log connection errors occasionally
+                if self.connection_attempts == 1 or self.connection_attempts % 5 == 0:
+                    logger_mp.warning(f"Connection failed: {type(e).__name__}")
                 
-            if self.running:
-                logger_mp.info(f"Will reconnect in {reconnect_delay:.1f} seconds...")
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-            else:
-                logger_mp.info("Stopping reconnection attempts")
+            finally:
+                self.websocket = None
+                self.connected = False
+                self.connection_event.clear()
+                
+            # Check if we should stop
+            if not self.running:
                 break
                 
-    async def _receive_loop(self, websocket):
-        """Dedicated loop for receiving messages"""
-        while self.running:
-            try:
-                # Receive with short timeout
-                message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+            # Wait with cancellable sleep
+            wait_until = time.time() + reconnect_delay
+            while self.running and time.time() < wait_until:
+                await asyncio.sleep(0.1)
                 
-                # Skip processing if we're not running anymore
+            reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+                
+    async def _receive_loop(self, websocket):
+        """Receive messages from WebSocket"""
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 5  # Reduced for faster detection
+        
+        while self.running and self.connected:
+            try:
+                # Receive with timeout
+                message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                consecutive_timeouts = 0
+                
                 if not self.running:
                     break
                 
-                # Initialize data as None
+                # Parse message
                 data = None
-                
-                # Check message type and process accordingly
                 if isinstance(message, str):
-                    # Handle string messages
                     if message == "pong":
-                        continue  # Skip pong messages
-                    else:
-                        # Try to parse as JSON
-                        try:
-                            logger_mp.info("Received a message")
-                            data = json.loads(message)
-                        except json.JSONDecodeError as e:
-                            logger_mp.debug(f"Received non-JSON string: {message[:100]}")
-                            continue
+                        continue
+                    try:
+                        data = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
                 elif isinstance(message, bytes):
-                    # Handle binary messages
                     try:
                         if self.use_msgpack:
                             data = msgpack.unpackb(message, raw=False)
                         else:
                             data = json.loads(message.decode('utf-8'))
-                    except msgpack.exceptions.ExtraData as e:
-                        logger_mp.error(f"Error parsing msgpack: {e}")
-                        continue
-                    except json.JSONDecodeError as e:
-                        logger_mp.error(f"Error parsing JSON from bytes: {e}")
-                        continue
-                    except Exception as e:
-                        logger_mp.error(f"Error deserializing message: {e}")
+                    except Exception:
                         continue
                 
-                # If we didn't get valid data, continue
-                if data is None:
+                if data is None or not isinstance(data, dict):
                     continue
                     
-                # Ensure data is a dictionary
-                if not isinstance(data, dict):
-                    logger_mp.warning(f"Received non-dictionary data: {type(data)}")
-                    continue
+                # Update last data time
+                self.last_data_time = time.time()
                 
-                # Track latency if timestamp present
+                # Track statistics if needed
                 if 'timestamp' in data:
                     latency = time.time() - data['timestamp']
                     with self.stats_lock:
                         self.latency_samples.append(latency)
                         
-                # Track dropped frames
                 if 'frame_id' in data:
                     frame_id = data['frame_id']
                     if self.last_frame_id >= 0:
@@ -317,27 +320,24 @@ class WebSocketReceiver:
                                 self.dropped_frames += dropped
                     self.last_frame_id = frame_id
                     
-                # Deserialize to TeleData dataclass
+                # Deserialize to TeleData
                 try:
                     tele_data = self.deserialize_teledata(data)
-                except Exception as e:
-                    logger_mp.error(f"Error deserializing TeleData: {e}", exc_info=True)
+                except Exception:
                     continue
                 
-                # Store in queue (latest only)
+                # Update queue - keep only latest
                 try:
-                    # Clear queue and add new data
-                    while True:
+                    while not self.data_queue.empty():
                         try:
                             self.data_queue.get_nowait()
                         except queue.Empty:
                             break
-                            
                     self.data_queue.put_nowait(tele_data)
-                except Exception as e:
-                    logger_mp.error(f"Error updating queue: {e}")
+                except queue.Full:
+                    pass
                     
-                # Update statistics
+                # Update stats
                 with self.stats_lock:
                     self.receive_count += 1
                     if isinstance(message, bytes):
@@ -346,45 +346,32 @@ class WebSocketReceiver:
                         self.total_bytes_received += len(message.encode('utf-8'))
                         
             except asyncio.TimeoutError:
-                # This is normal - just no data received within timeout
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= max_consecutive_timeouts:
+                    logger_mp.warning("Connection appears dead, reconnecting...")
+                    break
                 continue
-            except websockets.exceptions.ConnectionClosed as e:
-                logger_mp.warning(f"WebSocket connection closed: {e}")
-                break  # Exit loop to reconnect
-            except Exception as e:
-                logger_mp.error(f"Unexpected error in receive loop: {e}", exc_info=True)
-                # Don't break on unexpected errors, try to continue
-                await asyncio.sleep(0.1)
-        
-        logger_mp.info("Exiting receive loop")
                 
-    async def _measure_latency(self, websocket):
-        """Periodically measure round-trip latency"""
-        while self.running:
-            try:
-                start_time = time.time()
-                await websocket.send("ping")
-                pong = await asyncio.wait_for(websocket.recv(), timeout=1.0)
-                
-                if pong == "pong":
-                    latency = time.time() - start_time
-                    # Report latency to server
-                    await websocket.send(f"latency:{latency}")
-                    
-                await asyncio.sleep(5.0)  # Measure every 5 seconds
-                
-            except Exception:
+            except websockets.exceptions.ConnectionClosed:
+                logger_mp.info("Connection closed by server")
                 break
+                
+            except asyncio.CancelledError:
+                raise
+                
+            except Exception as e:
+                logger_mp.error(f"Receive error: {type(e).__name__}")
+                await asyncio.sleep(0.1)
                 
     def get_latest_data(self, timeout: float = 0.001) -> Optional[TeleData]:
         """Get only the most recent data, discard old"""
         try:
-            # Get all available data but keep only the last
+            # Empty queue except for last item
             data = None
             while not self.data_queue.empty():
                 data = self.data_queue.get_nowait()
                 
-            # If nothing was available, wait briefly
+            # If nothing available, wait briefly
             if data is None and timeout > 0:
                 try:
                     data = self.data_queue.get(timeout=timeout)
@@ -393,35 +380,34 @@ class WebSocketReceiver:
                     
             return data
             
-        except Exception as e:
+        except Exception:
             return None
+            
+    def is_connected(self) -> bool:
+        """Check if currently connected"""
+        return self.connected
+        
+    def wait_for_connection(self, timeout: float = 10.0) -> bool:
+        """Wait for connection to be established"""
+        return self.connection_event.wait(timeout=timeout)
+        
+    def get_data_age(self) -> float:
+        """Get seconds since last data received"""
+        return time.time() - self.last_data_time
 
     def print_stats(self):
-        """Print detailed performance statistics"""
+        """Print performance statistics (minimal output)"""
         with self.stats_lock:
             current_time = time.time()
             time_diff = current_time - self.last_stats_time
             
             if time_diff > 0 and self.receive_count > 0:
                 frequency = self.receive_count / time_diff
-                bandwidth = self.total_bytes_received / time_diff / 1024
-                avg_bytes = self.total_bytes_received / self.receive_count
                 
-                avg_latency = np.mean(self.latency_samples) * 1000 if self.latency_samples else 0
-                max_latency = np.max(self.latency_samples) * 1000 if self.latency_samples else 0
-                min_latency = np.min(self.latency_samples) * 1000 if self.latency_samples else 0
-                
-                print(f"\n--- WebSocket Client Stats ---")
-                print(f"Receive frequency: {frequency:.1f} Hz")
-                print(f"Bandwidth: {bandwidth:.1f} KB/s")
-                print(f"Avg message size: {avg_bytes:.0f} bytes")
-                print(f"Total received: {self.receive_count} messages")
-                print(f"Dropped frames: {self.dropped_frames}")
-                
-                if self.latency_samples:
-                    print(f"Latency - Avg: {avg_latency:.1f}ms, "
-                          f"Min: {min_latency:.1f}ms, Max: {max_latency:.1f}ms")
-                print("------------------------------\n")
+                # Only print basic stats
+                status = "Connected" if self.connected else "Disconnected"
+                data_age = self.get_data_age()
+                logger_mp.info(f"WS: {status} | {frequency:.1f} Hz | Age: {data_age:.1f}s | Dropped: {self.dropped_frames}")
                 
                 # Reset counters
                 self.last_stats_time = current_time
@@ -449,7 +435,7 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'e.g. pick the red cube on the table.', help = 'task goal for recording')
 
     # remote flags
-    parser.add_argument('--websocket_uri', type = str, default = 'ws://10.0.0.37:8765', help = 'WebSocket server URI')
+    parser.add_argument('--websocket_uri', type = str, default = 'ws://10.0.0.105:8765', help = 'WebSocket server URI')
     parser.add_argument('--image_server_ip', type = str, default = '127.0.0.1', help = 'Image server IP')
 
     args = parser.parse_args()
@@ -512,19 +498,26 @@ if __name__ == '__main__':
     # receive motion states from websocket
     ws_receiver = WebSocketReceiver(uri=args.websocket_uri)
     ws_receiver.start()
-    tele_data = None
+
+    # Wait for initial connection
+    logger_mp.info("Waiting for WebSocket connection...")
+    if ws_receiver.wait_for_connection(timeout=10.0):
+        logger_mp.info("WebSocket connected")
+    else:
+        logger_mp.warning("WebSocket connection timeout, will retry in background")
 
     # Wait for initial data
-    wait_time = 0
-    while wait_time < 5.0:  # Wait up to 5 seconds for initial data
+    tele_data = None
+    wait_start = time.time()
+    while time.time() - wait_start < 5.0:
         tele_data = ws_receiver.get_latest_data(timeout=0.1)
         if tele_data:
-            logger_mp.info("Received initial data from WebSocket")
+            logger_mp.info("Received initial data")
             break
         time.sleep(0.1)
-        wait_time += 0.1
-    else:
-        logger_mp.warning("Warning: No initial data received")
+
+    if not tele_data:
+        logger_mp.warning("No initial data received, continuing anyway")
 
     # Stats setting
     stats_interval = 5.0  # Print stats every 5 seconds
@@ -643,6 +636,7 @@ if __name__ == '__main__':
                             publish_reset_category(1, reset_pose_publisher)
 
                 # get input data
+                # get input data
                 t_get_start = time.time()
                 tele_data = ws_receiver.get_latest_data(timeout=0.001)
                 t_get_end = time.time()
@@ -650,9 +644,14 @@ if __name__ == '__main__':
                 if t_get_end - t_get_start > 0.01:  # Log if it takes more than 10ms
                     logger_mp.warning(f"get_latest_data took {t_get_end - t_get_start:.3f}s!")
 
+                # In the main loop, after getting tele_data:
                 if tele_data is None:
-                    # logger_mp.warning("No teledata received, skipping")
-                    # time.sleep(0.01)
+                    # Check connection health
+                    if not ws_receiver.is_connected():
+                        # Connection lost, but it will auto-reconnect
+                        pass  # Just continue, reconnection happens in background
+                    elif ws_receiver.get_data_age() > 5.0:
+                        logger_mp.warning(f"No data for {ws_receiver.get_data_age():.1f} seconds")
                     continue
 
                 if (args.ee == "dex3" or args.ee == "inspire1" or args.ee == "brainco") and args.xr_mode == "hand":
